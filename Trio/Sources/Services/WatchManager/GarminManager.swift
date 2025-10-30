@@ -811,90 +811,65 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                 // Process glucose readings
                 // For Trio: Process 2 readings (to calculate delta) but only send 1 entry
                 // For SwissAlpine: Process and send all 24 entries
+
+                // Calculate most recent timestamp once (outside loop)
+                let mostRecentTimestamp: UInt64? = {
+                    if let latestDetermination = determinationObjects.first,
+                       let loopTimestamp = latestDetermination.timestamp
+                    {
+                        return UInt64(loopTimestamp.timeIntervalSince1970 * 1000)
+                    }
+                    return nil
+                }()
+
+                // Process glucose readings
                 // All watchfaces expect array structure, but only SwissAlpine uses elements 1-23
                 let entriesToSend = self.needsHistoricalGlucoseData ? glucoseObjects.count : 1
 
                 for (index, glucose) in glucoseObjects.enumerated() {
-                    // For Trio, we process 2 readings but only add the first to watchStates
-                    // This allows delta calculation while sending only 1 entry
-                    if index >= entriesToSend {
-                        break
+                    guard index < entriesToSend else { break }
+
+                    // Validate glucose value early
+                    let glucoseValue = glucose.glucose
+                    guard glucoseValue >= 0, glucoseValue <= 500 else {
+                        if self.debugWatchState {
+                            debug(.watchManager, "⌚️ Invalid glucose value (\(glucoseValue)), skipping")
+                        }
+                        continue
                     }
 
                     var watchState = GarminWatchState()
 
-                    // Set timestamp for this glucose reading (in milliseconds)
-                    // For index 0 (most recent), use determination timestamp (last loop time)
-                    // For historical readings (index > 0), use glucose timestamp
+                    // Set timestamp
                     if index == 0 {
-                        // Use last loop time for the current reading
-                        if let latestDetermination = determinationObjects.first,
-                           let loopTimestamp = latestDetermination.timestamp
-                        {
-                            watchState.date = UInt64(loopTimestamp.timeIntervalSince1970 * 1000)
-                        } else if let glucoseDate = glucose.date {
-                            // Fallback to glucose date if no determination available
-                            watchState.date = UInt64(glucoseDate.timeIntervalSince1970 * 1000)
-                        }
+                        watchState.date = mostRecentTimestamp ?? glucose.date.map { UInt64($0.timeIntervalSince1970 * 1000) }
                     } else {
-                        // Historical readings use their actual glucose timestamp
-                        if let glucoseDate = glucose.date {
-                            watchState.date = UInt64(glucoseDate.timeIntervalSince1970 * 1000)
-                        }
+                        watchState.date = glucose.date.map { UInt64($0.timeIntervalSince1970 * 1000) }
                     }
 
-                    // Set SGV (already Int16, just validate it's reasonable)
-                    let glucoseValue = glucose.glucose
-                    // Glucose should be 0-500 range (0 = sensor error, 500+ = HIGH)
-                    if glucoseValue >= 0, glucoseValue <= 500 {
-                        watchState.sgv = glucoseValue // Already Int16, just assign
-                    } else {
-                        watchState.sgv = nil
-                        if self.debugWatchState {
-                            debug(.watchManager, "⌚️ Invalid glucose value (\(glucoseValue)), excluding from data")
-                        }
-                        continue // Skip this invalid glucose entry
-                    }
+                    watchState.sgv = glucoseValue
 
-                    // Only include direction and delta for the first entry (index 0)
+                    // Only add delta/direction for first entry
                     if index == 0 {
-                        // Set direction
                         watchState.direction = glucose.direction ?? "--"
 
-                        // Calculate delta if we have a next reading
                         if glucoseObjects.count > 1 {
                             let deltaValue = glucose.glucose - glucoseObjects[1].glucose
-                            // Delta is Int16 (mg/dL), validate reasonable range
-                            if deltaValue >= -100, deltaValue <= 100 {
-                                watchState.delta = deltaValue // Int16 value
-                            } else {
-                                watchState.delta = nil
-                                if self.debugWatchState {
-                                    debug(.watchManager, "⌚️ Delta out of range (\(deltaValue)), excluding from data")
-                                }
-                            }
+                            watchState.delta = (deltaValue >= -100 && deltaValue <= 100) ? deltaValue : nil
                         } else {
-                            // No previous reading available - set delta to 0
                             watchState.delta = 0
-                            if self.debugWatchState {
-                                debug(.watchManager, "⌚️ Only 1 glucose reading available, setting delta to 0")
-                            }
                         }
-                    }
-                    // For index 1-23: direction and delta are left as nil (excluded from JSON)
 
-                    // Only include extended data for the most recent reading (index 0)
-                    if index == 0 {
+                        // Add extended data
                         watchState.units_hint = unitsHint
                         watchState.iob = iobValue
                         watchState.cob = cobValue
-                        watchState.tbr = tbrValue // Current basal rate in U/hr
+                        watchState.tbr = tbrValue
                         watchState.isf = isfValue
                         watchState.eventualBG = eventualBGValue
                         watchState.sensRatio = sensRatioValue
                         watchState.displayPrimaryAttributeChoice = displayPrimaryAttributeChoice
                         watchState.displaySecondaryAttributeChoice = displaySecondaryAttributeChoice
-                        // noise is left as nil (will be excluded from JSON)
                     }
 
                     watchStates.append(watchState)
